@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Pinned downloads in Dockerfiles.
+
+  pins check DOCKERFILE ...    lint for unpinned or unchecked inputs
+  pins update DOCKERFILE ...   fill in hashes after a version bump (Renovate runs this)
+  pins list [DOCKERFILE ...]   inventory (all Dockerfiles by default)
+
+Each pinned input is a block of comment and ARG lines:
+
+  # renovate: datasource=... depName=... packageName=...
+  ARG TOOL_VERSION=1.2.3
+  # sha256-of: https://example.com/tool-${TOOL_VERSION}.tar.gz
+  ARG TOOL_SHA256=<64 hex>
+
+  # release-asset-of: owner/repo v${TOOL_VERSION} tool_(?<TOOL_BUILD>[0-9a-f]+)\\.zip
+  ARG TOOL_BUILD=<value>
+
+`update` only re-hashes URLs that changed since HEAD, so an upstream file that changes
+without a new version is never re-pinned.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+ARG = re.compile(r"^ARG ([A-Z0-9_]+)=(.*)$", re.M)
+SHA_OF = re.compile(r"^# sha256-of: (\S+)\nARG ([A-Z0-9_]+_SHA256)=(\S*)$", re.M)
+ASSET_OF = re.compile(r"^# release-asset-of: (\S+) (\S+) (\S+)\nARG ([A-Z0-9_]+)=(\S*)$", re.M)
+VAR = re.compile(r"\$\{([A-Z0-9_]+)\}")
+RENOVATE = re.compile(r"^# renovate: (.*)$")
+
+
+def blocks(text):
+    """(line, lines) per pinned input: from a renovate line (or a lone sha256-of) to the
+    next renovate line or non-comment, non-ARG line."""
+    out, cur, start = [], [], 0
+    for n, line in enumerate(text.splitlines() + [""], 1):
+        new = line.startswith("# renovate:") or (not cur and line.startswith(("# sha256-of:", "# release-asset-of:")))
+        if new or not line.startswith(("#", "ARG ")):
+            if cur:
+                out.append((start, cur))
+            cur, start = ([line], n) if new else ([], 0)
+        elif cur:
+            cur.append(line)
+    return out
+
+
+def args_of(text):
+    return dict(ARG.findall(text))
+
+
+def render(template, values):
+    missing = [v for v in VAR.findall(template) if v not in values]
+    if missing:
+        raise SystemExit(f"pins: {template} uses {', '.join(missing)}, which isn't an ARG")
+    return VAR.sub(lambda m: values[m.group(1)], template)
+
+
+def http(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "so-pins"})
+    if "api.github.com" in url and os.environ.get("GITHUB_TOKEN"):
+        req.add_header("Authorization", f"Bearer {os.environ['GITHUB_TOKEN']}")
+    return urllib.request.urlopen(req, timeout=120)
+
+
+def sha256_url(url):
+    h = hashlib.sha256()
+    with http(url) as r:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def head_text(path):
+    r = subprocess.run(["git", "show", f"HEAD:{path}"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def set_arg(text, name, value):
+    return re.sub(rf"^ARG {name}=.*$", f"ARG {name}={value}", text, count=1, flags=re.M)
+
+
+def update(path):
+    text = open(path).read()
+    old = args_of(head_text(path))
+    # values taken from a release asset's name
+    for repo, tag_t, pattern, name, current in ASSET_OF.findall(text):
+        tag = render(tag_t, args_of(text))
+        if old and render(tag_t, old) == tag:
+            continue
+        with http(f"https://api.github.com/repos/{repo}/releases/tags/{tag}") as r:
+            names = [a["name"] for a in json.load(r)["assets"]]
+        hits = [re.fullmatch(pattern, n) for n in names]
+        hits = [h for h in hits if h]
+        if len(hits) != 1:
+            raise SystemExit(f"pins: {repo} {tag}: expected one asset matching {pattern}, found {names}")
+        text = set_arg(text, name, hits[0].group(name))
+        print(f"{path}: {name}={hits[0].group(name)} (from {repo} {tag})")
+    # hashes, for changed URLs only
+    values = args_of(text)
+    for template, name, current in SHA_OF.findall(text):
+        url = render(template, values)
+        if old and all(v in old for v in VAR.findall(template)) and render(template, old) == url and current:
+            continue
+        sha = sha256_url(url)
+        text = set_arg(text, name, sha)
+        values[name] = sha
+        print(f"{path}: {name}={sha[:16]}… ({url})")
+    open(path, "w").write(text)
+
+
+FROM = re.compile(r"^FROM\s+(?:--platform=\S+\s+)?(\S+)", re.M | re.I)
+FORBIDDEN = [
+    (re.compile(r"@latest\b"), "@latest: pin a version"),
+    (re.compile(r"\bgo\s+install\s+[^\s@]+(\s|$)"), "go install without @version"),
+]
+NPM = re.compile(r"\b(npx|npm\s+(?:install|i|add))\b((?:\s+[^\s&;|]+)*)")
+
+
+def unversioned_npm(ins):
+    """Packages an npx/npm install line would fetch without a version."""
+    bad = []
+    for m in NPM.finditer(ins):
+        words = m.group(2).split()
+        if m.group(1) == "npx" and any(w in ("--no", "--no-install") for w in words):
+            continue                                 # runs a local package; never downloads
+        pkgs = [w for w in words if not w.startswith(("-", "$", ".", "/"))]
+        if m.group(1) == "npx":
+            pkgs = pkgs[:1]                          # only the package npx runs, not its arguments
+        bad += [p for p in pkgs if "@" not in p[1:]]
+    return bad
+
+
+def instructions(text):
+    """RUN/FROM instructions with line continuations joined, and their line numbers."""
+    out, buf, start = [], "", 0
+    for n, line in enumerate(text.splitlines(), 1):
+        if not buf:
+            start = n
+        buf += line.rstrip("\\") + " "
+        if not line.rstrip().endswith("\\"):
+            out.append((start, buf.strip()))
+            buf = ""
+    return out
+
+
+def check(path):
+    text = open(path).read()
+    errors = []
+    stages = {m.group(1).lower() for m in re.finditer(r"^FROM\s+\S+\s+AS\s+(\S+)", text, re.M | re.I)}
+    for n, ins in instructions(text):
+        where = f"{path}:{n}"
+        m = FROM.match(ins)
+        if m:
+            ref = m.group(1)
+            if ref.lower() not in stages | {"scratch"} and not ref.startswith("${") and "@sha256:" not in ref:
+                errors.append(f"{where}: FROM {ref} isn't pinned by digest")
+            continue
+        if not ins.upper().startswith("RUN"):
+            continue
+        if re.search(r"\b(curl|wget)\b[^\n]*https?://(?!localhost)", ins) and not re.search(r"sha256sum -c|\bgpg\b[^&;|]*--verify", ins):
+            errors.append(f"{where}: download without a hash or signature check in the same RUN")
+        if re.search(r"\bgit clone\b", ins) and not re.search(r"checkout\s+\$\{?[A-Z0-9_]*COMMIT\}?", ins):
+            errors.append(f"{where}: git clone without checking out a pinned *_COMMIT")
+        for pattern, what in FORBIDDEN:
+            if pattern.search(ins):
+                errors.append(f"{where}: {what}")
+        for pkg in unversioned_npm(ins):
+            errors.append(f"{where}: npm package {pkg} has no version")
+    for _, name, value in SHA_OF.findall(text):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            errors.append(f"{path}: {name} must be 64 hex characters")
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if line.startswith(("# renovate:", "# sha256-of:", "# release-asset-of:")):
+            nxt = text.splitlines()[line_no] if line_no < len(text.splitlines()) else ""
+            if not nxt.startswith("ARG "):
+                errors.append(f"{path}:{line_no}: {line.split(':')[0][2:]} comment must sit directly above an ARG")
+    return errors
+
+
+def inventory(path):
+    """Rows of (image, input, version, source, pin) for one Dockerfile."""
+    text, image = open(path).read(), os.path.basename(os.path.dirname(path)) or path
+    stages = {m.group(1).lower() for m in re.finditer(r"^FROM\s+\S+\s+AS\s+(\S+)", text, re.M | re.I)}
+    rows = []
+    for _, ins in instructions(text):
+        m = FROM.match(ins)
+        if m and m.group(1).lower() not in stages | {"scratch"} and not m.group(1).startswith("${"):
+            ref, _, digest = m.group(1).partition("@")
+            name, _, tag = ref.rpartition(":")
+            rows.append((image, "base image", tag, name, "digest " + digest[7:19] if digest else "UNPINNED"))
+    for _, lines in blocks(text):
+        args = [ARG.match(l).groups() for l in lines if ARG.match(l)]
+        meta = dict(kv.split("=", 1) for l in lines if RENOVATE.match(l) for kv in RENOVATE.match(l).group(1).split())
+        sha = next((SHA_OF.pattern and l[len("# sha256-of: "):] for l in lines if l.startswith("# sha256-of:")), "")
+        version = args[0][1] if args else ""
+        source = meta.get("packageName") or re.sub(r"^https?://([^/]+).*", r"\1", sha)
+        pin = "sha256" if sha else "commit" if any(a[0].endswith("_COMMIT") for a in args) else "version"
+        rows.append((image, meta.get("depName", args[0][0] if args else "?"), version, source, pin))
+    return rows
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("check", "update", "list") or (len(sys.argv) < 3 and sys.argv[1] != "list"):
+        raise SystemExit(__doc__.split("\n\n")[1])
+    cmd, paths = sys.argv[1], sys.argv[2:]
+    if cmd == "list":
+        if not paths:
+            paths = sorted(subprocess.run(["git", "ls-files", "*Dockerfile*"], capture_output=True, text=True).stdout.split())
+        rows = [r for p in paths for r in inventory(p)]
+        head = ("image", "input", "version", "source", "pin")
+        widths = [max(len(str(x)) for x in col) for col in zip(head, *rows)]
+        for r in [head, tuple("-" * w for w in widths)] + rows:
+            print("  ".join(str(x).ljust(w) for x, w in zip(r, widths)).rstrip())
+        return 0
+    if cmd == "update":
+        for p in paths:
+            update(p)
+        return 0
+    errors = [e for p in paths for e in check(p)]
+    for e in errors:
+        print(f"  x {e}")
+    print(f"{len(errors)} errors ({len(paths)} Dockerfiles)")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps Dockerfile pins current; routine updates batched per release cycle.",
+  "enabledManagers": [
+    "dockerfile",
+    "custom.regex"
+  ],
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Dependency Dashboard",
+  "minimumReleaseAge": "10 days",
+  "internalChecksFilter": "strict",
+  "prHourlyLimit": 0,
+  "prConcurrentLimit": 0,
+  "fetchChangeLogs": "off",
+  "includePaths": [
+    "so-nginx/Dockerfile",
+    "so-postgres/Dockerfile"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "ARGs under a # renovate: comment, plus a following *_COMMIT",
+      "managerFilePatterns": [
+        "/(^|/)Dockerfile[^/]*$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) packageName=(?<packageName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?(?: extractVersion=(?<extractVersion>\\S+))?\\nARG [A-Z0-9_]+=(?<currentValue>\\S+)(?:\\nARG [A-Z0-9_]+_COMMIT=(?<currentDigest>[0-9a-f]{40}))?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "RPM repos have no release dates",
+      "matchDatasources": [
+        "rpm"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Routine updates: one PR, on dashboard approval",
+      "matchPackageNames": [
+        "*"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "dependencies",
+      "groupSlug": "all",
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Majors: approved individually",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Closely tracked (ATT&CK, PostgreSQL): approved individually",
+      "matchDepNames": [
+        "attack-navigator",
+        "attack-enterprise-data",
+        "postgres"
+      ],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    }
+  ],
+  "postUpgradeTasks": {
+    "commands": [
+      "python3 tools/pins update {{{packageFile}}}"
+    ],
+    "fileFilters": [
+      "**/Dockerfile*"
+    ],
+    "executionMode": "update"
+  },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "Security fixes skip the batch",
+    "commitMessageSuffix": "",
+    "labels": []
+  }
+}
