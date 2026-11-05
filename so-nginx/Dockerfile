@@ -17,8 +17,8 @@
 FROM docker.io/library/node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS navigator-builder
 
 # renovate: datasource=github-tags depName=attack-navigator packageName=mitre-attack/attack-navigator
-ARG NAVIGATOR_VERSION=v5.3.0
-ARG NAVIGATOR_COMMIT=f40b225282c9c349bbe4a56f7ada142d79b705a3
+ARG NAVIGATOR_VERSION=v5.3.2
+ARG NAVIGATOR_COMMIT=76bf61f12f68b80a1eaeb3a2f9d3a816efc22ce1
 # renovate: datasource=github-tags depName=attack-enterprise-data packageName=mitre-attack/attack-stix-data extractVersion=^v(?<version>.+)$
 ARG ATTACK_VERSION=16.1
 # sha256-of: https://raw.githubusercontent.com/mitre-attack/attack-stix-data/v${ATTACK_VERSION}/enterprise-attack/enterprise-attack-${ATTACK_VERSION}.json
